@@ -10,12 +10,15 @@ from tqdm import tqdm
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--bench-name", type=str, default="mt_bench")
+    parser.add_argument("--bench-name", type=str, default="gsm8k")
     parser.add_argument("--input-file", type=str, 
-                        default="llama38b2_40-temperature-0.0.jsonl")
+                        default="eagle/data/mt_bench/reference_answer/gpt-4.jsonl")
     parser.add_argument("--judge-model", type=str, 
                         default="/home/ruiyang.chen/hfd/Llama-3.1-8B-Instruct")
     args = parser.parse_args()
+
+    if args.bench_name == "mt_bench":
+        raise NotImplementedError
 
     base_model_path = args.judge_model
 
@@ -45,13 +48,15 @@ if __name__ == "__main__":
 
     samples = []
     root_dir = osp.dirname(__file__)
-    with open(osp.join(root_dir, args.bench_name, args.input_file), 'r', encoding='utf-8') as f:
-        print(f"open file in {osp.join(root_dir, args.bench_name, args.input_file)}")
+
+    file_path = osp.join(root_dir, "eagle", "data", args.bench_name, "question.jsonl")
+
+    with open(file_path, 'r', encoding='utf-8') as f:
+        print(f"open file in {file_path}")
         for line in f:
             obj = json.loads(line)
-            full_text = obj.get("choices")[0].get("turns")
-            for texts in full_text:
-                samples.append(full_text)
+            full_text = obj.get("turns")[0] + "\n" + obj.get("reference")[0]
+            samples.append(full_text)
 
     total_loss = 0.0
     total_tokens = 0
@@ -73,8 +78,8 @@ if __name__ == "__main__":
         local_tokens = num_tokens
         avg_nll = local_loss / local_tokens
         ppl = torch.exp(torch.tensor(avg_nll))
-        # print(text)
-        # print(f"Local Perplexity: {ppl.item():.2f}")
+        print(text)
+        print(f"Local Perplexity: {ppl.item():.2f}")
 
         total_loss += loss.item() * num_tokens
         total_tokens += num_tokens
