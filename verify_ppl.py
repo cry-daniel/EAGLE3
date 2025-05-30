@@ -17,7 +17,7 @@ if __name__ == "__main__":
                         default="/home/ruiyang.chen/hfd/Llama-3.1-8B-Instruct")
     args = parser.parse_args()
 
-    if args.bench_name == "mt_bench":
+    if args.bench_name not in ["mt_bench", "alpaca", "human_eval", "sum"]:
         raise NotImplementedError
 
     base_model_path = args.judge_model
@@ -49,17 +49,34 @@ if __name__ == "__main__":
     samples = []
     root_dir = osp.dirname(__file__)
 
-    file_path = osp.join(root_dir, "eagle", "data", args.bench_name, "question.jsonl")
+    if args.bench_name in ["alpaca", "human_eval", "sum"]:
 
-    with open(file_path, 'r', encoding='utf-8') as f:
-        print(f"open file in {file_path}")
-        for line in f:
-            obj = json.loads(line)
-            full_text = obj.get("turns")[0] + "\n" + obj.get("reference")[0]
-            samples.append(full_text)
+        file_path = osp.join(root_dir, "eagle", "data", args.bench_name, "question.jsonl")
+
+        with open(file_path, 'r', encoding='utf-8') as f:
+            print(f"open file in {file_path}")
+            for line in f:
+                obj = json.loads(line)
+                full_text = obj.get("turns")[0] + "\n" + obj.get("reference")[0]
+                samples.append(full_text)
+    elif args.bench_name in ["mt_bench"]:
+
+        file_path = osp.join(root_dir, "eagle", "data", args.bench_name, "question.jsonl")
+
+        with open(file_path, 'r', encoding='utf-8') as f:
+            print(f"open file in {file_path}")
+            for line in f:
+                obj = json.loads(line)
+                try:
+                    obj.get("reference")[0]
+                except:
+                    continue
+                full_text = obj.get("turns")[0] + "\n" + obj.get("reference")[0] + "\n" + obj.get("turns")[1] + "\n" + obj.get("reference")[1]
+                samples.append(full_text)
 
     total_loss = 0.0
     total_tokens = 0
+    total_local_loss = []
 
     for text in tqdm(samples, desc="Evaluating PPL"):
         # print(text)
@@ -78,6 +95,7 @@ if __name__ == "__main__":
         local_tokens = num_tokens
         avg_nll = local_loss / local_tokens
         ppl = torch.exp(torch.tensor(avg_nll))
+        total_local_loss.append(ppl.item())
         print(text)
         print(f"Local Perplexity: {ppl.item():.2f}")
 
@@ -87,3 +105,4 @@ if __name__ == "__main__":
     avg_nll = total_loss / total_tokens
     ppl = torch.exp(torch.tensor(avg_nll))
     print(f"\nAverage Perplexity: {ppl.item():.2f}")
+    print(f"\nAverage Local Perplexity: {sum(total_local_loss)/len(total_local_loss):.2f}")
