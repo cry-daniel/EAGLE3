@@ -41,7 +41,7 @@ except:
     from choices import *
     from utils import prepare_logits_processor
 
-
+DRAFT_MODEL_ATTN_INDEX = 0
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
@@ -246,6 +246,7 @@ class LlamaAttention(nn.Module):
             past_key_value: Optional[Tuple[torch.Tensor]] = None,
             output_attentions: bool = False,
             use_cache: bool = False,
+            print_tag: Optional[str] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
@@ -310,6 +311,11 @@ class LlamaAttention(nn.Module):
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, value_states)
+        
+        # global DRAFT_MODEL_ATTN_INDEX
+        # print('draftattn_weights',print_tag,DRAFT_MODEL_ATTN_INDEX,attn_weights.shape)
+        # torch.save(attn_weights,f'/home/ruiyang.chen/Code/LLM/EAGLE3/eagle/checkattn/draft{DRAFT_MODEL_ATTN_INDEX}.pt')
+        # DRAFT_MODEL_ATTN_INDEX+=1
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -407,6 +413,8 @@ class LlamaDecoderLayeremb(nn.Module):
             past_key_value: Optional[Tuple[torch.Tensor]] = None,
             output_attentions: Optional[bool] = False,
             use_cache: Optional[bool] = False,
+            print_tag: Optional[str] = None,
+            output_attn_weight: bool = False,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
@@ -438,9 +446,14 @@ class LlamaDecoderLayeremb(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
-            output_attentions=output_attentions,
+            output_attentions=output_attn_weight,
             use_cache=use_cache,
+            print_tag="midlayer"
         )
+        
+        if output_attn_weight:
+            return self_attn_weights
+        
         hidden_states = residual + hidden_states
 
         # Fully Connected
@@ -456,6 +469,7 @@ class LlamaDecoderLayeremb(nn.Module):
 
         if use_cache:
             outputs += (present_key_value,)
+
 
         return outputs
 
@@ -522,10 +536,6 @@ class Model(nn.Module):
         self.total_tokens = total_tokens - 1
         self.depth = depth
         self.threshold = math.log(threshold)
-        # print("total_tokens",total_tokens)
-        # print("depth",depth)
-        # print("top_k",top_k)
-        # print("threshold",threshold)
         self.hidden_size = config.hidden_size
         self.midlayer = LlamaDecoderLayeremb(config)
         if hasattr(config, "target_hidden_size"):
@@ -595,8 +605,7 @@ class Model(nn.Module):
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
-            output_attn_weights: bool = False,
-            std=None
+            output_attn_weight: bool = False,
     ):
         batch_size, seq_length, _ = hidden_states.shape
         seq_length_with_past = seq_length
@@ -653,10 +662,9 @@ class Model(nn.Module):
             past_key_value=past_key_value,
             output_attentions=output_attentions,
             use_cache=True,
+            output_attn_weight=output_attn_weight
         )
-        if output_attn_weights:
-            return layer_outputs[1]
-
+        if output_attn_weight: return layer_outputs
         if use_cache:
             next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
         hidden_states = layer_outputs[0]
@@ -669,6 +677,69 @@ class Model(nn.Module):
 
     def reset_kv(self):
         self.stable_kv = None
+
+    def capture_draft_atten_weight(
+            self,
+            hidden_states,
+            input_ids,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            output_attn_weight= None
+    ):
+        batch_size, seq_length, _ = hidden_states.shape
+        seq_length_with_past = seq_length
+        past_key_values_length = 0
+
+        with torch.no_grad():
+            inputs_embeds = self.embed_tokens(input_ids)
+            # inputs_embeds = inputs_embeds.detach()
+
+        # if std is not None:
+        #     noise = torch.randn(inputs_embeds.size(),device=inputs_embeds.device) * std
+        #     inputs_embeds=inputs_embeds+noise
+
+        if position_ids is None:
+            device = hidden_states.device if hidden_states is not None else inputs_embeds.device
+            position_ids = torch.arange(
+                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
+            )
+            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+        else:
+            position_ids = position_ids.view(-1, seq_length).long()
+
+        #position_ids=position_ids//4
+        if attention_mask is None:
+            attention_mask = torch.ones(
+                (batch_size, seq_length_with_past), dtype=torch.bool, device=hidden_states.device
+            )
+        attention_mask = self._prepare_decoder_attention_mask(
+            attention_mask, (batch_size, seq_length), hidden_states, past_key_values_length
+        )
+
+        # if self.gradient_checkpointing and self.training:
+        #    if use_cache:
+        #        use_cache = False
+
+        # hidden_states=self.act(self.fc(torch.cat((inputs_embeds,hidden_states),dim=-1)))
+        inputs_embeds = inputs_embeds.to(hidden_states.dtype)
+        if hidden_states.shape[-1]!=inputs_embeds.shape[-1]:
+            hidden_states = self.fc(hidden_states)
+        # hidden_states = self.fc(hidden_states)
+
+        layer_outputs = self.midlayer(
+            input_emb=inputs_embeds,
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=None,
+            output_attentions=output_attn_weight,
+            use_cache=True,
+            output_attn_weight=output_attn_weight
+        )
+
+        return layer_outputs
+
 
     @torch.no_grad()
     def topK_genrate(self, hidden_states, input_ids, head, logits_processor):
@@ -683,6 +754,7 @@ class Model(nn.Module):
         scores_list = []
         parents_list = []
         ss_token = []
+        ss_attnweight = []
 
         input_ids = input_ids[:, 1:]
         input_ids = input_ids.to(hidden_states.device)
@@ -709,172 +781,21 @@ class Model(nn.Module):
         scores = topk_p[0]
         scores_list.append(scores[None])
         parents_list.append(torch.zeros(1, dtype=torch.long, device=scores.device))
+        
+        # print('draftinputing:',topk_index+self.d2t[topk_index])
         if self.config.vocab_size==self.config.draft_vocab_size:
             ss_token.append(topk_index)
             input_ids = topk_index
         else:
             ss_token.append(topk_index+self.d2t[topk_index])
             input_ids = topk_index+self.d2t[topk_index]
-        input_hidden = last_hidden[None].repeat(1, top_k, 1)
-        tree_mask = self.tree_mask_init
-        topk_cs_index = torch.arange(top_k, device=self.embed_tokens.weight.device)
 
-        # 4
-        for i in range(depth):
-            self.tree_mask = tree_mask
-            position_ids = len_posi + self.position_ids
-            # with Timer("draft one"):
-            out_hidden, past_key_values = self(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
-                                               position_ids=position_ids, use_cache=True)
-            len_posi += 1
-
-            # with Timer("sort1"):
-            bias1 = top_k if i > 0 else 0
-            bias2 = max(0, i - 1)
-            bias = 1 + top_k ** 2 * bias2 + bias1
-            parents = (topk_cs_index + bias)
-            parents_list.append(parents)
-
-            last_headout = self.lm_head(self.norm(out_hidden[0]))
-            last_p = self.logsoftmax(last_headout)
-
-            top = torch.topk(last_p, top_k, dim=-1)
-            topk_index, topk_p = top.indices, top.values
-
-            cu_scores = topk_p + scores[:, None]
-
-            topk_cs = torch.topk(cu_scores.view(-1), top_k, dim=-1)
-            topk_cs_index, topk_cs_p = topk_cs.indices, topk_cs.values
-            scores = topk_cs_p
-
-            out_ids = topk_cs_index // top_k
-            input_hidden = out_hidden[:, out_ids]
-
-            input_ids = topk_index.view(-1)[topk_cs_index][None]
-
-            if self.config.vocab_size == self.config.draft_vocab_size:
-                ss_token.append(topk_index)
-            else:
-                input_ids = input_ids + self.d2t[input_ids]
-                ss_token.append(topk_index+self.d2t[topk_index])
-            scores_list.append(cu_scores)
-            tree_mask = torch.cat((tree_mask[:, :, out_ids], self.tree_mask_init), dim=3)
-
-
-        scores_list = torch.cat(scores_list, dim=0).view(-1)
-        ss_token_list = torch.cat(ss_token, dim=0).view(-1)
-        top_scores = torch.topk(scores_list, total_tokens, dim=-1)
-        top_scores_index = top_scores.indices
-        top_scores_index = torch.sort(top_scores_index).values
-
-        draft_tokens = ss_token_list[top_scores_index]
-        draft_tokens = torch.cat((sample_token, draft_tokens), dim=0)
-
-        draft_parents = torch.cat(parents_list, dim=0)[top_scores_index // top_k].long()
-        mask_index = torch.searchsorted(top_scores_index, draft_parents - 1, right=False)
-        # mask_index[(top_scores_index[mask_index]!=draft_parents - 1)]=-1
-        mask_index[draft_parents == 0] = -1
-        mask_index = mask_index + 1
-        mask_index_list = mask_index.tolist()
-        # with Timer("mask"):
-        tree_mask = torch.eye(total_tokens + 1).bool()
-        tree_mask[:, 0] = True
-        for i in range(total_tokens):
-            tree_mask[i + 1].add_(tree_mask[mask_index_list[i]])
-
-
-        tree_position_ids = torch.sum(tree_mask, dim=1) - 1
-
-        tree_mask = tree_mask.float()[None, None]
-        draft_tokens = draft_tokens[None]
-
-        del parents_list, scores_list, ss_token, ss_token_list, draft_parents
-
-        # with Timer("retrieve"):
-
-        max_depth = torch.max(tree_position_ids) + 1
-        noleaf_index = torch.unique(mask_index).tolist()
-        noleaf_num = len(noleaf_index) - 1
-        leaf_num = total_tokens - noleaf_num
-
-        retrieve_indices = torch.zeros(leaf_num, max_depth.item(), dtype=torch.long) - 1
-        retrieve_indices = retrieve_indices.tolist()
-
-        rid = 0
-        position_ids_list = tree_position_ids.tolist()
-
-        for i in range(total_tokens + 1):
-            if i not in noleaf_index:
-                cid = i
-                depth = position_ids_list[i]
-                for j in reversed(range(depth + 1)):
-                    retrieve_indices[rid][j] = cid
-                    cid = mask_index_list[cid - 1]
-                rid += 1
-
-        if logits_processor is not None:
-            maxitem = total_tokens + 5
-
-            def custom_sort(lst):
-                # sort_keys=[len(list)]
-                sort_keys = []
-                for i in range(len(lst)):
-                    sort_keys.append(lst[i] if lst[i] >= 0 else maxitem)
-                return sort_keys
-
-            retrieve_indices = sorted(retrieve_indices, key=custom_sort)
-
-        retrieve_indices = torch.tensor(retrieve_indices, dtype=torch.long)
-        del mask_index, mask_index_list, noleaf_index, noleaf_num, leaf_num, max_depth, rid
-        tree_position_ids = tree_position_ids.to(hidden_states.device)
-
-        return draft_tokens, retrieve_indices, tree_mask, tree_position_ids
-
-    @torch.no_grad()
-    def topK_genrate_w_prune(self, hidden_states, input_ids, head, logits_processor):
-
-        input_ids = input_ids.to(hidden_states.device)
-        total_tokens = self.total_tokens
-        depth = self.depth
-        top_k = self.top_k
-
-        sample_token = input_ids[:, -1]
-
-        scores_list = []
-        parents_list = []
-        ss_token = []
-
-        input_ids = input_ids[:, 1:]
-        input_ids = input_ids.to(hidden_states.device)
-
-        len_posi = input_ids.shape[1]
-        self.reset()
-
-        # with Timer("draft many"):
-        if hasattr(self, "stable_kv") and self.stable_kv is not None:
-            kv_len = self.stable_kv[0][0].shape[2]
-            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids[:, kv_len:],
-                                               past_key_values=self.stable_kv, use_cache=True)
-        else:
-            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids, use_cache=True)
-        self.stable_kv = past_key_values
-        last_hidden = out_hidden[:, -1]
-
-        # last_headout = head(last_hidden)
-        last_headout = self.lm_head(self.norm(last_hidden))
-
-        last_p = self.logsoftmax(last_headout)
-        top = torch.topk(last_p, top_k, dim=-1)
-        topk_index, topk_p = top.indices, top.values
-        scores = topk_p[0]
-        scores_list.append(scores[None])
-        parents_list.append(torch.zeros(1, dtype=torch.long, device=scores.device))
-        if self.config.vocab_size==self.config.draft_vocab_size:
-            ss_token.append(topk_index)
-            input_ids = topk_index
-        else:
-            ss_token.append(topk_index+self.d2t[topk_index])
-            input_ids = topk_index+self.d2t[topk_index]
+        
+        # input_hiddens_again = last_hidden[None].repeat(1, top_k, 1)
+        # out_attn_weight = self(input_hiddens_again, input_ids=topk_index, past_key_values=past_key_values, position_ids=torch.zeros(top_k, device=self.embed_tokens.weight.device, dtype=torch.long), use_cache=True, output_attn_weight=True)
+        # ss_attnweight.append(out_attn_weight)
+        # print(out_attn_weight.shape)
+        
         input_hidden = last_hidden[None].repeat(1, top_k, 1)
         tree_mask = self.tree_mask_init
         topk_cs_index = torch.arange(top_k, device=self.embed_tokens.weight.device)
@@ -891,8 +812,6 @@ class Model(nn.Module):
                                                position_ids=position_ids, use_cache=True)
             len_posi += 1
 
-            # print(f"debug1: {input_hidden.shape, input_ids.shape, len(past_key_values) ,position_ids.shape}")
-
             # with Timer("sort1"):
             bias1 = top_k if i > 0 else 0
             bias2 = max(0, i - 1)
@@ -913,12 +832,29 @@ class Model(nn.Module):
             scores = topk_cs_p
 
             out_ids = topk_cs_index // top_k
+            # print(out_hidden.shape,out_ids)
             input_hidden = out_hidden[:, out_ids]
             # New
             draft_hidden.append(input_hidden)
+            
+            # Do forwarding again
+            # print('midlayer forwarding new:',topk_index.view(-1)[None]+ self.d2t[topk_index.view(-1)[None]])
+            # ipt_hid=[]
+            # input_hidden_again = out_hidden[None].repeat(1, top_k, 1)
+            # for i in range(top_k):
+            #     for _ in range(top_k):
+            #         ipt_hid.append(out_hidden[:, i,:])
+            # input_hiddens_again = torch.stack(ipt_hid).permute(1,0,2)
+            # print(input_hiddens_again.shape)
+            # out_attn_weight = self(input_hiddens_again, input_ids=topk_index.view(-1)[None], past_key_values=past_key_values,
+            #                                    position_ids= len_posi + torch.zeros(top_k*top_k, device=self.embed_tokens.weight.device, dtype=torch.long), use_cache=True, output_attn_weight=True)
+            # ss_attnweight.append(out_attn_weight)
+            # print(out_attn_weight.shape)
 
             input_ids = topk_index.view(-1)[topk_cs_index][None]
-
+            # print('draftinputing:',input_ids)
+            # print('draftinputingnew:',input_ids + self.d2t[input_ids])
+            # print('vocavsize',self.config.vocab_size,self.config.draft_vocab_size)
             if self.config.vocab_size == self.config.draft_vocab_size:
                 ss_token.append(topk_index)
             else:
@@ -927,23 +863,34 @@ class Model(nn.Module):
             scores_list.append(cu_scores)
             tree_mask = torch.cat((tree_mask[:, :, out_ids], self.tree_mask_init), dim=3)
 
+
         scores_list = torch.cat(scores_list, dim=0).view(-1)
         ss_token_list = torch.cat(ss_token, dim=0).view(-1)
         # New
         draft_hidden_list = torch.cat(draft_hidden, dim=1)
-
+        # max_width = max(t.size(-1) for t in ss_attnweight)  # 308
+        # ss_attnweight_padded = []
+        # for t in ss_attnweight:
+        #     padded_t = F.pad(t, (0, max_width - t.size(-1), 0, 0))
+        #     # print(padded_t.shape)
+        #     ss_attnweight_padded.append(padded_t)
+        # ss_attnweight_list = torch.cat(ss_attnweight_padded, dim=2)
+        # print(ss_attnweight_list.shape,ss_token_list.shape)
         top_scores = torch.topk(scores_list, total_tokens, dim=-1)
         top_scores_index = top_scores.indices
         top_scores_index = torch.sort(top_scores_index).values
 
         draft_tokens = ss_token_list[top_scores_index]
         draft_tokens = torch.cat((sample_token, draft_tokens), dim=0)
+        # draft_attnweight = ss_attnweight_list[:,:,top_scores_index,:]
+        
         # New
         draft_hiddens = draft_hidden_list[:, top_scores_index // top_k, :]
         draft_hiddens = torch.cat((last_hidden.unsqueeze(1), draft_hiddens), dim=1)
+        # draft_attnweight = torch.cat((torch.zeros((1,32,1,max_width),device='cuda'), draft_attnweight), dim=2)
+        # print(draft_tokens.shape,draft_attnweight.shape)
 
         draft_parents = torch.cat(parents_list, dim=0)[top_scores_index // top_k].long()
-
         mask_index = torch.searchsorted(top_scores_index, draft_parents - 1, right=False)
         # mask_index[(top_scores_index[mask_index]!=draft_parents - 1)]=-1
         mask_index[draft_parents == 0] = -1
@@ -1000,23 +947,25 @@ class Model(nn.Module):
         retrieve_indices = torch.tensor(retrieve_indices, dtype=torch.long)
         del mask_index, mask_index_list, noleaf_index, noleaf_num, leaf_num, max_depth, rid
         tree_position_ids = tree_position_ids.to(hidden_states.device)
-
-        attn_output = None
-
-        # print(f"debug2: {draft_hiddens.shape, draft_tokens.shape, len(past_key_values) , tree_position_ids.shape}")
-
-        attn_output = self(
+        
+        print(draft_tokens.shape,tree_position_ids.shape,self.position_ids.shape,self.position_ids)
+        attnoutput = self(
             hidden_states = draft_hiddens,
             input_ids = draft_tokens, 
             past_key_values = self.stable_kv, 
             position_ids = tree_position_ids, 
             output_attentions = True,
-            output_attn_weights = True
+            output_attn_weight = True
         )
+        
+        global DRAFT_MODEL_ATTN_INDEX
+        print('draftattn_weights',DRAFT_MODEL_ATTN_INDEX,attnoutput .shape)
+        torch.save(attnoutput ,f'/home/ruiyang.chen/Code/LLM/EAGLE3/eagle/checkattn/draft{DRAFT_MODEL_ATTN_INDEX}.pt')
+        DRAFT_MODEL_ATTN_INDEX+=1
 
-        # print(f"attn_output1: {attn_output}")
+        return draft_tokens, retrieve_indices, tree_mask, tree_position_ids
 
-        return draft_tokens, retrieve_indices, tree_mask, tree_position_ids, attn_output
+
 
 
 import torch

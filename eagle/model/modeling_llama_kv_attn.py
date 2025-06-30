@@ -33,6 +33,7 @@ logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlamaConfig"
 
+REAL_MODEL_ATTN_INDEX = 0
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
 def _make_causal_mask(
@@ -648,7 +649,7 @@ class LlamaAttention(nn.Module):
             past_key_value: Optional[Tuple[torch.Tensor]] = None,
             output_attentions: bool = False,
             use_cache: bool = False,
-            top_tokens=None
+            print_tag: Optional[str] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
@@ -720,11 +721,6 @@ class LlamaAttention(nn.Module):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        # if (top_tokens is not None):
-        #     import pdb; pdb.set_trace()
-        #     top_token_mask = torch.full(attention_mask.shape, torch.finfo(attention_mask.dtype).min, device=attention_mask.device)
-        #     top_token_mask[:, :, :, kv_seq_len-q_len:] = 0
-
         attn_weights = torch.matmul(
             query_states, key_states.transpose(2, 3)
         ) / math.sqrt(self.head_dim)
@@ -742,19 +738,16 @@ class LlamaAttention(nn.Module):
                 )
             attn_weights = attn_weights + attention_mask
 
-        if (top_tokens is not None):
-            # import pdb; pdb.set_trace()
-            top_token_mask = torch.full(attention_mask.shape, torch.finfo(attention_mask.dtype).min, device=attention_mask.device)
-            top_token_mask[:, :, :, kv_seq_len-q_len:] = 0
-            row_ids = torch.arange(q_len).unsqueeze(1).expand(-1, top_tokens.shape[-1])
-            top_token_mask[:,:,row_ids,top_tokens]=0
-            attn_weights = attn_weights + top_token_mask
-
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(
             attn_weights, dim=-1, dtype=torch.float32
         ).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, value_states)
+        
+        global REAL_MODEL_ATTN_INDEX
+        print('attn_weights',print_tag,REAL_MODEL_ATTN_INDEX,attn_weights.shape)
+        torch.save(attn_weights,f'/home/ruiyang.chen/Code/LLM/EAGLE3/eagle/checkattn/real{REAL_MODEL_ATTN_INDEX}.pt')
+        REAL_MODEL_ATTN_INDEX+=1
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -820,7 +813,7 @@ class LlamaDecoderLayer(nn.Module):
             past_key_value: Optional[Tuple[torch.Tensor]] = None,
             output_attentions: Optional[bool] = False,
             use_cache: Optional[bool] = False,
-            top_tokens=None
+            print_tag: Optional[str] = None,
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
@@ -858,7 +851,7 @@ class LlamaDecoderLayer(nn.Module):
             past_key_value=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
-            top_tokens=top_tokens
+            print_tag=print_tag,
         )
         hidden_states = residual + hidden_states
 
@@ -1070,8 +1063,8 @@ class LlamaModel(LlamaPreTrainedModel):
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
-            top_tokens=None
     ) -> Union[Tuple, BaseModelOutputWithPast]:
+        print('llamamodel forward',input_ids.shape)
         output_attentions = (
             output_attentions
             if output_attentions is not None
@@ -1151,7 +1144,7 @@ class LlamaModel(LlamaPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
 
-        for idx, decoder_layer in enumerate(self.layers):
+        for idx, decoder_layer in enumerate(self.layers): # decoder loop
             if idx==len(self.layers)-3 or idx==len(self.layers)//2 or idx==2:
                 all_hidden_states += (hidden_states,)
 
@@ -1183,7 +1176,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
-                    top_tokens=top_tokens
+                    print_tag=str(idx)
                 )
 
             hidden_states = layer_outputs[0]
@@ -1265,7 +1258,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
-            top_tokens=None
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -1318,7 +1310,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            top_tokens=top_tokens
         )
 
         hidden_states = outputs[0]
