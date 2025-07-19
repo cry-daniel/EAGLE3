@@ -35,6 +35,8 @@ class EaModel(nn.Module):
             top_k,
             threshold,
             ea_layer_state_dict,
+            important_metric,
+            important_metric_value
     ):
 
         super().__init__()
@@ -46,6 +48,8 @@ class EaModel(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_name_or_path, use_fast=False)
         self.use_eagle3 = use_eagle3
         config = EConfig.from_pretrained(ea_model_path)
+        self.important_metric = important_metric
+        self.important_metric_value = important_metric_value
         with open(ea_model_path, "r") as f:
             con = json.loads(f.read())
         try:
@@ -95,6 +99,8 @@ class EaModel(nn.Module):
             depth=7,
             top_k=10,
             threshold=1.0,
+            important_metric='undefined',
+            important_metric_value=None,
             **kwargs,
     ):
         # assert Type=="LLaMA" or "Mixtral"
@@ -138,7 +144,9 @@ class EaModel(nn.Module):
             depth,
             top_k,
             threshold,
-            ea_layer_state_dict
+            ea_layer_state_dict,
+            important_metric,
+            important_metric_value,
         )
 
         if total_token == -1:
@@ -359,7 +367,7 @@ class EaModel(nn.Module):
 
             draft_tokens = draft_tokens.to(input_ids.device)
 
-            top_tokens = find_important_tokens(attn_output)
+            top_tokens = find_important_tokens(attn_output,self.important_metric,self.important_metric_value,self.ea_layer.total_tokens)
             # print(f"draft shape: {draft_tokens.shape}")
             # print(f"past_kv shape: {len(past_key_values), past_key_values[15][0].shape}")
 

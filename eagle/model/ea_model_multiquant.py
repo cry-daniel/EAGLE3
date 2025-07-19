@@ -9,17 +9,19 @@ from transformers import AutoTokenizer
 import os
 from transformers import PreTrainedModel, PretrainedConfig, AutoConfig
 
-from .modeling_llama_kv import LlamaForCausalLM as KVLlamaForCausalLM
+from .modeling_llama_kv_multiquant import LlamaForCausalLM as KVLlamaForCausalLM
 from .modeling_mixtral_kv import MixtralForCausalLM as KVMixtralForCausalLM
 #from .modeling_qwen2_kv import LlamaForCausalLM as KVQwen2ForCausalLM
 from .modeling_qwen2_kv import Qwen2ForCausalLM as KVQwen2ForCausalLM
 from .utils import *
 from .kv_cache import initialize_past_key_values
 
-from .cnets import Model
-from .cnets1 import Model as Model1
+from .cnets_multiquant import Model
+# from .cnets1 import Model as Model1
 from .configs import EConfig
+from copy import deepcopy
 
+from .antquant import quantize_model, quantize_model_low, set_quantizer, set_quantizer_low, enable_quantization
 
 class EaModel(nn.Module):
 
@@ -27,6 +29,7 @@ class EaModel(nn.Module):
             self,
             use_eagle3,
             base_model,
+            # low_model,
             base_model_name_or_path,
             ea_model_path,
             total_token,
@@ -34,10 +37,12 @@ class EaModel(nn.Module):
             top_k,
             threshold,
             ea_layer_state_dict,
+            highprec_model
     ):
 
         super().__init__()
         self.base_model = base_model
+        self.highprec_model = highprec_model
         self.config = base_model.config
         self.hidden_size = base_model.lm_head.weight.shape[-1]
         self.vocab_size = base_model.lm_head.weight.shape[0]
@@ -94,6 +99,7 @@ class EaModel(nn.Module):
             depth=7,
             top_k=10,
             threshold=1.0,
+            quantparams=None,
             **kwargs,
     ):
         # assert Type=="LLaMA" or "Mixtral"
@@ -111,6 +117,21 @@ class EaModel(nn.Module):
             base_model = KVMixtralForCausalLM.from_pretrained(
                 base_model_path, **kwargs
             )
+            
+        print("BaseModel Quantization Enabling")
+        # print(base_model.dtype)
+        # base_model = base_model.float()
+        # low_model = deepcopy(base_model)
+        set_quantizer(quantparams)
+        highprec_model = quantize_model(base_model)
+        enable_quantization(highprec_model)
+        
+        set_quantizer_low(quantparams)
+        base_model = quantize_model_low(base_model)
+        enable_quantization(base_model)
+        
+        # print(base_model)
+        # base_model = base_model.half()
 
         configpath = os.path.join(ea_model_path, "config.json")
         if not os.path.exists(configpath):
@@ -137,7 +158,8 @@ class EaModel(nn.Module):
             depth,
             top_k,
             threshold,
-            ea_layer_state_dict
+            ea_layer_state_dict,
+            highprec_model
         )
 
         if total_token == -1:
@@ -171,24 +193,44 @@ class EaModel(nn.Module):
             past_key_values=None,
             output_orig=False,
             position_ids=None,
+            high_prec=False
     ):
+        if high_prec:
+            with torch.inference_mode():
+                # Pass input through the base model
+                outputs = self.highprec_model.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    position_ids=position_ids,
+                )
+                if output_orig:
+                    orig = self.base_model.lm_head(outputs[0])
+                hidden_states = outputs[0]
 
-        with torch.inference_mode():
-            # Pass input through the base model
-            outputs = self.base_model.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                position_ids=position_ids,
-            )
             if output_orig:
-                orig = self.base_model.lm_head(outputs[0])
-            hidden_states = outputs[0]
-
-        if output_orig:
-            return outputs, orig, hidden_states
+                return outputs, orig, hidden_states
+            else:
+                return outputs, hidden_states
         else:
-            return outputs, hidden_states
+            with torch.inference_mode():
+                # Pass input through the base model
+                outputs = self.base_model.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    position_ids=position_ids,
+                )
+                if output_orig:
+                    orig = self.base_model.lm_head(outputs[0])
+                hidden_states = outputs[0]
+
+            if output_orig:
+                return outputs, orig, hidden_states
+            else:
+                return outputs, hidden_states
+        
+        
 
     @torch.no_grad()
     def eagenerate(
@@ -238,17 +280,42 @@ class EaModel(nn.Module):
         input_len = input_ids.shape[1]
         reset_tree_mode(self)
         # prefill
-        draft_tokens, retrieve_indices, tree_mask, tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
+        draft_tokens, retrieve_indices, tree_mask, tree_position_ids, logits, hidden_state, sample_token, tree_branch_sum = initialize_tree_w_quant(
             input_ids, self, past_key_values, logits_processor
         )
         new_token = 0
         max_length = max_length - self.ea_layer.total_tokens - 10
         for idx in range(max_length):
             # with Timer("all"):
-            self.base_model.model.tree_mask = tree_mask
+            # print("Shaping:",draft_tokens.shape,retrieve_indices.shape,tree_branch_sum.shape)
+            # print(draft_tokens,retrieve_indices,tree_branch_sum)
 
             draft_tokens = draft_tokens.to(input_ids.device)
+            retrieve_indices = retrieve_indices.to(input_ids.device)
+            # e.g. [ 0,  1, 10, 31, 40, 51, -1], 这些需要高精度
+            # print(retrieve_indices.device,tree_branch_sum.device)
+            highprec_branchindex = tree_branch_sum.argmax()
+            highprec_retrieve = retrieve_indices[highprec_branchindex]
+            # print(highprec_retrieve.device)
+            # highprec_retrieve = highprec_retrieve[highprec_retrieve != -1]
+            # print(highprec_retrieve.device)
+            # print(draft_tokens)
+            # highprec_tokens = draft_tokens[:,highprec_retrieve]
+            # print(highprec_tokens)
+            highprec_retrieve = highprec_retrieve[highprec_retrieve != -1]
+            highprec_tokens = draft_tokens[:,highprec_retrieve]
+            # print(highprec_tokens)
+            highprec_treeids = torch.arange(highprec_retrieve.shape[0],dtype=tree_position_ids.dtype,device=highprec_tokens.device)
+            highprec_treemask = torch.tril(torch.ones(highprec_retrieve.shape[0], highprec_retrieve.shape[0], dtype=tree_mask.dtype, device=tree_mask.device)).unsqueeze(0).unsqueeze(0)
+            
+            # print(highprec_retrieve)
+            # print(highprec_tokens,highprec_treeids)
+            # print(tree_position_ids,tree_mask)
+            # print(draft_tokens.shape,tree_position_ids.shape,tree_mask.shape)
+            # print(highprec_tokens.shape,highprec_treeids.shape,highprec_treemask.shape)
+
             # Target model forward, get logits
+            self.base_model.model.tree_mask = tree_mask
             logits, hidden_state_new, outputs = tree_decoding(
                 self,
                 draft_tokens,
@@ -257,20 +324,33 @@ class EaModel(nn.Module):
                 input_ids,
                 retrieve_indices,
             )
-            # retrieve_indices=tree_buffers["retrieve_indices"]
-            # logits = logits[0, retrieve_indices]
+            
+            # Target model forward, get logits
+            self.base_model.model.tree_mask = highprec_treemask
+            highprec_logits, highprec_hidden_state_new, highprec_outputs = tree_decoding_highprec(
+                self,
+                highprec_tokens,
+                past_key_values,
+                highprec_treeids,
+                input_ids
+            )
+            
+            logits[highprec_branchindex,:highprec_logits.shape[0]] = highprec_logits
+            hidden_state_new[0, highprec_retrieve, :] = highprec_hidden_state_new[0, :, :]
+            
             draft_tokens = torch.cat((draft_tokens, padding), dim=1)
             # candidates 直接对应的就是完整的输出的话，例如
             # tensor([[  334,  1453, 43680, 43680, 43680, 43680, 43680],
             # [  334,     1, 43680, 43680, 43680, 43680, 43680], ...]
+            
             candidates = draft_tokens[0, retrieve_indices]
             # verification
-            best_candidate, accept_length, sample_p = evaluate_posterior(
-                logits, candidates, logits_processor
+            best_candidate, accept_length, sample_p = evaluate_posterior_w_quant(
+                logits, candidates, logits_processor, tree_branch_sum=tree_branch_sum
             )
             # print(accept_length)
             # Adjusting the input sequence, draft model forward
-            input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
+            input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token, tree_branch_sum = update_inference_inputs_w_quant(
                 input_ids,
                 candidates,
                 best_candidate,
@@ -443,6 +523,7 @@ class EaModel(nn.Module):
                 input_ids,
                 retrieve_indices,
             )
+            
             # retrieve_indices=tree_buffers["retrieve_indices"]
             # logits = logits[0, retrieve_indices]
             draft_tokens = torch.cat((draft_tokens, padding), dim=1)

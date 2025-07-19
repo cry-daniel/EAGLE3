@@ -27,7 +27,32 @@ except:
     from eagle.model.kv_cache import initialize_past_key_values
     from eagle.model.utils import *
 
+import re
+ANS_RE = re.compile(r"#### (\-?[0-9\.\,]+)")
+INVALID_ANS = "[invalid]"
 
+def extract_final_answer(text):
+    numbers = re.findall(r'\d+', text)
+    return numbers[-1] if numbers else None
+
+def extract_answer_gsm8k(completion):
+    match = ANS_RE.search(completion)
+    if match:
+        match_str = match.group(1).strip()
+        match_str = match_str.replace(",", "")
+        return match_str
+    else:
+        return INVALID_ANS
+
+
+def is_correct(model_completion, reference):
+    generated = extract_final_answer(model_completion)
+    gt_answer = extract_answer_gsm8k(reference)
+    # print('Find answer:',generated)
+    # print('target answer:',gt_answer)
+    # print('result:',generated == gt_answer)
+    assert gt_answer != INVALID_ANS
+    return generated == gt_answer
 
 def run_eval(
         base_model_path,
@@ -113,6 +138,7 @@ def get_model_answers(
         # load_in_8bit=True,
         device_map="auto",
         use_eagle3=args.use_eagle3,
+        quantparams=args,
     )
 
     tokenizer = model.get_tokenizer()
@@ -210,7 +236,7 @@ def get_model_answers(
     #         })
     # print('Warmup done')
 
-    questions=questions[:5]
+    questions=questions[:args.question_nums]
     for question in tqdm(questions):
 
         choices = []
@@ -225,6 +251,7 @@ def get_model_answers(
             new_tokens = []
             wall_time = []
             ppls = []
+            accs = []
             for j in range(len(question["turns"])):
                 qs = question["turns"][j]
                 messages.append({
@@ -255,6 +282,7 @@ def get_model_answers(
                     loss = model.base_model(output_ids, labels=output_ids).loss
 
                 ppl = torch.exp(loss)
+                ppls.append(float(ppl))
 
                 output_ids = output_ids[0][len(input_ids[0]):]
                 # be consistent with the template's stop_token_ids
@@ -287,6 +315,11 @@ def get_model_answers(
                         output = output.replace(special_token, "")
                 output = output.strip()
 
+                if args.bench_name in ['gsm8k']:
+                    print(output,question["reference"][j])
+                    acc = 1 if is_correct(output,question["reference"][j]) else 0
+                    accs.append(acc)
+
                 turns.append(output)
                 idxs.append(int(idx))
                 new_tokens.append(int(new_token))
@@ -295,9 +328,8 @@ def get_model_answers(
                     "role": "assistant",
                     "content": output
                 })
-                ppls.append(float(ppl))
             # torch.cuda.empty_cache()
-            choices.append({"index": i, "turns": turns, "idxs": idxs, "new_tokens": new_tokens, "wall_time": wall_time, "ppl": ppls})
+            choices.append({"index": i, "turns": turns, "idxs": idxs, "new_tokens": new_tokens, "wall_time": wall_time, "ppl": ppls, "acc": accs})
 
         # Dump answers
         os.makedirs(os.path.dirname(answer_file), exist_ok=True)
@@ -416,6 +448,67 @@ if __name__ == "__main__":
         "--use_eagle3",
         action="store_true"
     )
+    parser.add_argument(
+        "--question_nums",
+        type=int,
+        default=20,
+        help="The number of GPUs per model.",
+    )
+    
+
+    ## For quantization
+    parser.add_argument('--mode', default='base', type=str,
+                    help='quantizer mode')
+    parser.add_argument('--wbit', '-wb', default='8', type=int, 
+                        help='weight bit width')
+    parser.add_argument('--abit', '-ab', default='8', type=int, 
+                        help='activation bit width')
+    parser.add_argument('--wbit_low', '-wbl', default='8', type=int, 
+                        help='weight bit width')
+    parser.add_argument('--abit_low', '-abl', default='8', type=int, 
+                        help='activation bit width')
+    parser.add_argument('--percentile', '-pct', default='100', type=int, 
+                        help='percent')
+    parser.add_argument('--sigma', '-s', default='0', type=float, 
+                        help='Init activation range with Batchnorm Sigma')
+    parser.add_argument('--disable_quant', default=False, action='store_true', 
+                        help='disable quant')
+    parser.add_argument('--disable_input_quantization', default=False, action='store_true', 
+                        help='quant_input')
+    parser.add_argument('--search', default=False, action='store_true', 
+                        help='search alpha')
+    parser.add_argument('--w_up', '-wu', default='150', type=int, 
+                        help='weight search upper bound')
+    parser.add_argument('--a_up', '-au', default='150', type=int, 
+                        help='activation search upper bound')
+    parser.add_argument('--w_low', '-wl', default='75', type=int, 
+                        help='weight search lower bound')
+    parser.add_argument('--a_low', '-al', default='75', type=int, 
+                        help='activation search lower bound')
+    parser.add_argument('--layer_8bit_n', '-n8', default='0', type=int, 
+                        help='number of 8-bit layers')
+    parser.add_argument('--layer_8bit_l', '-l8', default=None, type=str, 
+                        help='list of 8-bit layers')
+    parser.add_argument(
+        "--quantize_batch_size",
+        type=int,
+        default=64,
+        help="Batch size (per device) for quantization.",
+    )
+    parser.add_argument(
+        "--no_outlier",
+        action="store_true"
+    )
+
+    # parser.add_argument(
+    #     "--mode",type=str,default="ant-int",
+    # )
+    # parser.add_argument("--wbit",type=int,default=8)
+    # parser.add_argument("--abit",type=int,default=8)
+    # parser.add_argument("--wbit_low",type=int,default=8)
+    # parser.add_argument("--abit_low",type=int,default=8)
+    
+
 
     args = parser.parse_args()
 
@@ -432,7 +525,7 @@ if __name__ == "__main__":
     if args.answer_file:
         answer_file = args.answer_file
     else:
-        answer_file = f"{args.bench_name}/{args.model_id}.jsonl"
+        answer_file = f"{args.bench_name}/antquant{args.wbit}{args.abit}-{args.model_id}.jsonl"
 
     print(f"Output to {answer_file}")
 

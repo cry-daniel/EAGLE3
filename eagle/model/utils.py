@@ -277,6 +277,29 @@ def initialize_tree_w_prune(input_ids, model, past_key_values, logits_processor)
     draft_tokens, retrieve_indices,tree_mask,tree_position_ids, attn_output = model.ea_layer.topK_genrate_w_prune(hidden_states, input_ids, model.base_model.lm_head,logits_processor)
     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, orig, hidden_states, token, attn_output
 
+def initialize_tree_w_quant(input_ids, model, past_key_values, logits_processor):
+    outputs, orig, hidden_states = model(
+        input_ids, past_key_values=past_key_values, output_orig=True
+    )
+
+    if logits_processor is not None:
+        logits = orig[:, -1]
+        logits = logits_processor(None, logits)
+        probabilities = torch.nn.functional.softmax(logits, dim=1)
+        token = torch.multinomial(probabilities, 1)
+    else:
+        token = torch.argmax(orig[:, -1])
+        token = token[None, None]
+    input_ids = torch.cat((input_ids, token.to(input_ids.device)), dim=1)
+
+    # Clone the output hidden states
+    if model.use_eagle3:
+        ea_device = model.ea_layer.lm_head.weight.device
+        if outputs["hidden_states"][0].device != ea_device:
+            outputs["hidden_states"] = [x.to(ea_device) for x in outputs["hidden_states"]]
+        hidden_states=torch.cat(outputs["hidden_states"],dim=-1)
+    draft_tokens, retrieve_indices,tree_mask,tree_position_ids, tree_branch_sum = model.ea_layer.topK_genrate_w_quant(hidden_states, input_ids, model.base_model.lm_head,logits_processor)
+    return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, orig, hidden_states, token, tree_branch_sum
 
 def reset_tree_mode(
         model,
@@ -351,7 +374,38 @@ def tree_decoding(
             outputs["hidden_states"] = [x.to(ea_device) for x in outputs["hidden_states"]]
         hidden_state = torch.cat(outputs["hidden_states"], dim=-1)
 
+    # 将 tree_logits 按照多个完整的话展开，每句话都会选择自己的 token 对应的那些 logits
+    # logits 其实就是 lm_head 的输出
     logits = tree_logits[0, retrieve_indices]
+    return logits, hidden_state, outputs
+
+def tree_decoding_highprec(
+        model,
+        tree_candidates,
+        past_key_values,
+        tree_position_ids,
+        input_ids
+):
+    position_ids = tree_position_ids + input_ids.shape[1]
+    if position_ids is not None and position_ids.dim() == 1:
+            position_ids = position_ids.unsqueeze(0)
+    outputs, tree_logits, hidden_state = model(
+        tree_candidates,
+        output_orig=True,
+        past_key_values=past_key_values,
+        position_ids=position_ids,
+        high_prec=True
+    )
+
+    if model.use_eagle3:
+        ea_device = model.ea_layer.lm_head.weight.device
+        if outputs["hidden_states"][0].device != ea_device:
+            outputs["hidden_states"] = [x.to(ea_device) for x in outputs["hidden_states"]]
+        hidden_state = torch.cat(outputs["hidden_states"], dim=-1)
+
+    # 将 tree_logits 按照多个完整的话展开，每句话都会选择自己的 token 对应的那些 logits
+    # logits 其实就是 lm_head 的输出
+    logits = tree_logits[0, :]
     return logits, hidden_state, outputs
 
 def tree_decoding_w_prune(
@@ -387,13 +441,50 @@ def tree_decoding_w_prune(
 def find_important_tokens(
         attn_output,
         metric = "topk",
-        metric_value = 100
+        metric_value = 100,
+        total_tokens = None
 ):
     # print(f"attn shape: {attn_output.shape}")
+    # print(metric,metric_value)
     # Only support for batch size = 1 as EAGLE3. For larger batch size, we should change dim=(0,1) to dim=(1)
-    attn_sum = attn_output.mean(dim=(0, 1))
+    attn_sum = attn_output.mean(dim=(0, 1))[:,:-total_tokens]
     if (metric == "topk"):
+        metric_value=int(metric_value)
         top_values, top_indices = torch.topk(attn_sum, k=metric_value, dim=1)
+    elif (metric == "toppercent"):
+        metric_value = int(attn_output.shape[-1]*metric_value)
+        top_values, top_indices = torch.topk(attn_sum, k=metric_value, dim=1)
+    elif (metric == "maxtop50p"):
+        metric_value = max(int(attn_output.shape[-1]*metric_value),50)
+        # print(metric_value)
+        top_values, top_indices = torch.topk(attn_sum, k=metric_value, dim=1)
+    elif (metric == "maxtop75p"):
+        metric_value = max(int(attn_output.shape[-1]*metric_value),75)
+        top_values, top_indices = torch.topk(attn_sum, k=metric_value, dim=1)
+    elif (metric == "maxtop100p"):
+        metric_value = max(int(attn_output.shape[-1]*metric_value),100)
+        # print(metric_value)
+        top_values, top_indices = torch.topk(attn_sum, k=metric_value, dim=1)
+    elif (metric == "maxtop150p"):
+        metric_value = max(int(attn_output.shape[-1]*metric_value),150)
+        top_values, top_indices = torch.topk(attn_sum, k=metric_value, dim=1)
+    elif (metric == "topp"):
+        top_indices = []
+        # 遍历每个token位置的注意力权重
+        for i in range(attn_sum.size(0)):
+            weights = attn_sum[i, :]
+            sorted_weights, sorted_idx = torch.sort(weights, descending=True)
+            cum_probs = torch.cumsum(sorted_weights, dim=0)
+            mask = cum_probs > metric_value
+            if mask.any():
+                first_above = torch.nonzero(mask, as_tuple=True)[0][0]
+                selected_idx = sorted_idx[:first_above + 1]
+            else:
+                selected_idx = sorted_idx
+            top_indices.append(selected_idx)
+        
+        # 转换为张量列表
+        # top_indices = torch.tensor(top_indices,device=attn_output.device)
     else:
         raise NotImplementedError
     
@@ -425,11 +516,14 @@ def evaluate_posterior(
     # Greedy decoding based on temperature value
     if logits_processor is None:
         # Find the tokens that match the maximum logits for each position in the sequence
+        # posterior_mask e.g. tensor([[1, 1, 1, 0, 0, 0], [0, 1, 1, 1, 0, 1]]
         posterior_mask = (
                 candidates[:, 1:].to(logits.device) == torch.argmax(logits[:, :-1], dim=-1)
         ).int()
+        # 上面的例子 accept_length 为 3，注意一定要是连续的 1 才算，只要前面有 1 个 0 那么后面就全是 0 ，和输出的话是连续的 token 有关
         candidates_accept_length = (torch.cumprod(posterior_mask, dim=1)).sum(dim=1)
         accept_length = candidates_accept_length.max()
+        # import pdb; pdb.set_trace()
         # Choose the best candidate
         if accept_length == 0:
             # Default to the first candidate if none are accepted
@@ -480,6 +574,98 @@ def evaluate_posterior(
             sample_p = torch.softmax(gt_logits, dim=0)
         return torch.tensor(best_candidate), accept_length - 1, sample_p
 
+def evaluate_posterior_w_quant(
+        logits: torch.Tensor,
+        candidates: torch.Tensor,
+        logits_processor,
+        tree_branch_sum = None
+):
+    """
+    Evaluate the posterior probabilities of the candidates based on the provided logits and choose the best candidate.
+
+    Depending on the temperature value, the function either uses greedy decoding or evaluates posterior
+    probabilities to select the best candidate.
+
+    Args:
+    - logits (torch.Tensor): Predicted logits of shape (batch_size, sequence_length, vocab_size).
+    - candidates (torch.Tensor): Candidate token sequences.
+    - temperature (float): Softmax temperature for probability scaling. A value of 0 indicates greedy decoding.
+    - posterior_threshold (float): Threshold for posterior probability.
+    - posterior_alpha (float): Scaling factor for the threshold.
+
+    Returns:
+    - best_candidate (torch.Tensor): Index of the chosen best candidate.
+    - accept_length (int): Length of the accepted candidate sequence.
+    """
+    # Greedy decoding based on temperature value
+    if logits_processor is None:
+        # Find the tokens that match the maximum logits for each position in the sequence
+        # posterior_mask e.g. tensor([[1, 1, 1, 0, 0, 0], [0, 1, 1, 1, 0, 1]]
+        posterior_mask = (
+                candidates[:, 1:].to(logits.device) == torch.argmax(logits[:, :-1], dim=-1)
+        ).int()
+        # import pdb; pdb.set_trace()
+        # 上面的例子 accept_length 为 3，注意一定要是连续的 1 才算，只要前面有 1 个 0 那么后面就全是 0 ，和输出的话是连续的 token 有关
+        candidates_accept_length = (torch.cumprod(posterior_mask, dim=1)).sum(dim=1)
+        accept_length = candidates_accept_length.max()
+        # print('---------------------------------------')
+        # print(f"candidate accept length and max value position: {candidates_accept_length, candidates_accept_length.argmax()}")
+        # print(f"tree branch sum and max value position: {tree_branch_sum, tree_branch_sum.argmax()}")
+        # sorted_indices = torch.argsort(candidates_accept_length, descending=True)
+        # rank = torch.searchsorted(candidates_accept_length[sorted_indices], candidates_accept_length[tree_branch_sum.argmax()], side='right') + 1
+        # rank = candidates_accept_length[candidates_accept_length > candidates_accept_length[tree_branch_sum.argmax()]].shape
+        # print(f"max tree branch sum's accept length and its rank: {candidates_accept_length[tree_branch_sum.argmax()], rank}")
+
+        # import pdb; pdb.set_trace()
+        # Choose the best candidate
+        if accept_length == 0:
+            # Default to the first candidate if none are accepted
+            best_candidate = torch.tensor(0, dtype=torch.long, device=candidates.device)
+        else:
+            best_candidate = torch.argmax(candidates_accept_length).to(torch.long)
+        return best_candidate, accept_length, logits[best_candidate, accept_length]
+
+    else:
+        accept_length = 1
+        accept_cand = candidates[0][:1]
+        best_candidate = 0
+        for i in range(1, candidates.shape[1]):
+            if i != accept_length:
+                break
+            adjustflag = False
+            is_eq = (candidates[:, :accept_length] == accept_cand).all(dim=1)
+            fi = torch.nonzero(is_eq, as_tuple=True)[0][0]
+            gt_logits = logits[fi, i - 1][None]
+            gt_logits = logits_processor(None, gt_logits)[0]
+            gtp = torch.softmax(gt_logits, dim=0)
+            candidates_set = []
+            for j in range(candidates.shape[0]):
+                if is_eq[j]:
+                    x = candidates[j, i]
+                    xi = x.item()
+                    if xi in candidates_set or xi == -1:
+                        continue
+                    candidates_set.append(xi)
+                    r = random.random()
+                    px = gtp[xi]
+                    qx = 1.0
+                    acp = px / qx
+                    if r <= acp:
+                        accept_cand = torch.cat((accept_cand, x[None]), dim=0)
+                        accept_length += 1
+                        best_candidate = j
+                        break
+                    else:
+                        gtp[xi] = 0
+                        gtp = gtp / gtp.sum()
+                        adjustflag = True
+        if adjustflag and accept_length != candidates.shape[1]:
+            sample_p = gtp
+        else:
+            gt_logits = logits[best_candidate, accept_length - 1][None]
+            gt_logits = logits_processor(None, gt_logits)[0]
+            sample_p = torch.softmax(gt_logits, dim=0)
+        return torch.tensor(best_candidate), accept_length - 1, sample_p
 
 @torch.no_grad()
 def update_inference_inputs(
@@ -597,6 +783,65 @@ def update_inference_inputs_w_prune(
     # print(f"attn_output2: {attn_output}")
 
     return input_ids, draft_tokens, retrieve_indices,tree_mask,tree_position_ids, new_token, None, token, attn_output
+
+@torch.no_grad()
+def update_inference_inputs_w_quant(
+        input_ids,
+        candidates,
+        best_candidate,
+        accept_length,
+        retrieve_indices,
+        logits_processor,
+        new_token,
+        past_key_values_data_list,
+        current_length_data,
+        model,
+        hidden_state_new,
+        sample_p
+):
+    prev_input_len = input_ids.shape[1]
+    # Map the best candidate indices to the original indices in the sequence
+    select_indices = (
+            retrieve_indices[best_candidate, : accept_length + 1] + prev_input_len
+    )
+    # Append the tokens from the best candidate to the input sequence
+    input_ids = torch.cat(
+        [input_ids, candidates[None, best_candidate, : accept_length + 1].to(input_ids.device)], dim=-1
+    )
+    # Update the past key values based on the selected tokens
+    # Source tensor that contains relevant past information based on the selected candidate
+    for past_key_values_data in past_key_values_data_list:
+        tgt = past_key_values_data[..., select_indices.to(past_key_values_data.device), :]
+        # Destination tensor where the relevant past information will be stored
+        dst = past_key_values_data[..., prev_input_len: prev_input_len + tgt.shape[-2], :]
+        # Copy relevant past information from the source to the destination
+        dst.copy_(tgt, non_blocking=True)
+
+    # Update the current length tensor (currently only support batch size is 1)
+    current_length_data.fill_(prev_input_len + tgt.shape[-2])
+
+    retrieve_hidden_state_new = hidden_state_new[:, retrieve_indices]
+    accept_hidden_state_new = retrieve_hidden_state_new[:, best_candidate, : accept_length + 1]
+    # token=model.base_model.lm_head(accept_hidden_state_new[:,-1]).argmax()
+    # token=token[None,None]
+    prob = sample_p
+    if logits_processor is not None:
+        token = torch.multinomial(prob, 1)
+        token = token[None]
+    else:
+        token = torch.argmax(prob)
+        token = token[None, None]
+    # hidden_state = torch.cat((hidden_state, accept_hidden_state_new), dim=1)
+    draft_tokens, retrieve_indices,tree_mask,tree_position_ids, tree_branch_sum = model.ea_layer.topK_genrate_w_quant(accept_hidden_state_new,
+                                              input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
+                                              head=model.base_model.lm_head,logits_processor=logits_processor)
+
+
+    new_token += accept_length + 1
+
+    # print(f"attn_output2: {attn_output}")
+
+    return input_ids, draft_tokens, retrieve_indices,tree_mask,tree_position_ids, new_token, None, token, tree_branch_sum
 
 if __name__ == "__main__":
     logits = torch.randn(1, 5)

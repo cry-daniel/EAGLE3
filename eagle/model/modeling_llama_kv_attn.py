@@ -746,7 +746,7 @@ class LlamaAttention(nn.Module):
         
         global REAL_MODEL_ATTN_INDEX
         print('attn_weights',print_tag,REAL_MODEL_ATTN_INDEX,attn_weights.shape)
-        torch.save(attn_weights,f'/home/ruiyang.chen/Code/LLM/EAGLE3/eagle/checkattn/real{REAL_MODEL_ATTN_INDEX}.pt')
+        torch.save(attn_weights,f'/home/chenruiyang/Code/LLM/EAGLE3/eagle/checkattn/real{REAL_MODEL_ATTN_INDEX}.pt')
         REAL_MODEL_ATTN_INDEX+=1
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):

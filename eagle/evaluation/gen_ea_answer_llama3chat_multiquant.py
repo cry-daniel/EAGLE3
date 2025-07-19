@@ -19,15 +19,42 @@ from fastchat.llm_judge.common import load_questions
 from tqdm import tqdm
 
 try:
-    from ..model.ea_model_attn import EaModel
+    from ..model.ea_model_multiquant import EaModel
     from ..model.kv_cache import initialize_past_key_values
     from ..model.utils import *
 except:
-    from eagle.model.ea_model_attn import EaModel
+    from eagle.model.ea_model_multiquant import EaModel
     from eagle.model.kv_cache import initialize_past_key_values
     from eagle.model.utils import *
 
+import re
 
+import re
+ANS_RE = re.compile(r"#### (\-?[0-9\.\,]+)")
+INVALID_ANS = "[invalid]"
+
+def extract_final_answer(text):
+    numbers = re.findall(r'\d+', text)
+    return numbers[-1] if numbers else None
+
+def extract_answer_gsm8k(completion):
+    match = ANS_RE.search(completion)
+    if match:
+        match_str = match.group(1).strip()
+        match_str = match_str.replace(",", "")
+        return match_str
+    else:
+        return INVALID_ANS
+
+
+def is_correct(model_completion, reference):
+    generated = extract_final_answer(model_completion)
+    gt_answer = extract_answer_gsm8k(reference)
+    # print('Find answer:',generated)
+    # print('target answer:',gt_answer)
+    # print('result:',generated == gt_answer)
+    assert gt_answer != INVALID_ANS
+    return generated == gt_answer
 
 def run_eval(
         base_model_path,
@@ -113,6 +140,7 @@ def get_model_answers(
         # load_in_8bit=True,
         device_map="auto",
         use_eagle3=args.use_eagle3,
+        quantparams=args,
     )
 
     tokenizer = model.get_tokenizer()
@@ -130,8 +158,87 @@ def get_model_answers(
 
     question = questions[0]
 
+    # # warmup
+    # for _ in range(3):
+    #     torch.manual_seed(0)
 
-    questions=questions[:5]
+    #     messages = [
+    #         {"role": "system",
+    #          "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."},
+    #     ]
+    #     turns = []
+    #     idxs = []
+    #     new_tokens = []
+    #     wall_time = []
+    #     for j in range(len(question["turns"])):
+    #         qs = question["turns"][j]
+    #         messages.append({
+    #             "role": "user",
+    #             "content": qs
+    #         })
+    #         prompt = tokenizer.apply_chat_template(
+    #             messages,
+    #             tokenize=False,
+    #             add_generation_prompt=True,
+    #         )
+    #         input_ids = tokenizer([prompt],add_special_tokens=False,).input_ids
+
+    #         # try:
+    #         torch.cuda.synchronize()
+    #         start_time = time.time()
+
+    #         output_ids, new_token, idx = model.eagenerate(
+    #             torch.as_tensor(input_ids).cuda(),
+    #             temperature=temperature,
+    #             log=True,
+    #             is_llama3=True,
+    #         )
+    #         torch.cuda.synchronize()
+    #         total_time = time.time() - start_time
+    #         output_ids = output_ids[0][len(input_ids[0]):]
+    #         # be consistent with the template's stop_token_ids
+    #         stop_token_ids = [
+    #             tokenizer.eos_token_id,
+    #             tokenizer.convert_tokens_to_ids("<|eot_id|>")
+    #         ]
+
+    #         if stop_token_ids:
+    #             stop_token_ids_index = [
+    #                 i
+    #                 for i, id in enumerate(output_ids)
+    #                 if id in stop_token_ids
+    #             ]
+    #             if len(stop_token_ids_index) > 0:
+    #                 output_ids = output_ids[: stop_token_ids_index[0]]
+
+    #         output = tokenizer.decode(
+    #             output_ids,
+    #             spaces_between_special_tokens=False,
+    #         )
+    #         # stop_str = "</s>"
+    #         # if stop_str and output.find(stop_str) > 0:
+    #         #     output = output[: output.find(stop_str)]
+    #         for special_token in tokenizer.special_tokens_map.values():
+    #             if isinstance(special_token, list):
+    #                 for special_tok in special_token:
+    #                     output = output.replace(special_tok, "")
+    #             else:
+    #                 output = output.replace(special_token, "")
+    #         output = output.strip()
+
+
+
+    #         turns.append(output)
+    #         idxs.append(int(idx))
+    #         new_tokens.append(int(new_token))
+    #         wall_time.append(total_time)
+    #         messages.append({
+    #             "role": "assistant",
+    #             "content": output
+    #         })
+    # print('Warmup done')
+
+    questions=questions[:args.question_nums]
     for question in tqdm(questions):
 
         choices = []
@@ -145,6 +252,8 @@ def get_model_answers(
             idxs = []
             new_tokens = []
             wall_time = []
+            ppls = []
+            accs = []
             for j in range(len(question["turns"])):
                 qs = question["turns"][j]
                 messages.append({
@@ -170,6 +279,15 @@ def get_model_answers(
                 )
                 torch.cuda.synchronize()
                 total_time = time.time() - start_time
+
+                if args.bench_name in ['bench_mt']:
+                    with torch.no_grad():
+                        loss = model.base_model(output_ids, labels=output_ids).loss
+
+                    ppl = torch.exp(loss)
+                    ppls.append(float(ppl))
+                
+
                 output_ids = output_ids[0][len(input_ids[0]):]
                 # be consistent with the template's stop_token_ids
                 stop_token_ids = [
@@ -200,6 +318,11 @@ def get_model_answers(
                     else:
                         output = output.replace(special_token, "")
                 output = output.strip()
+                
+                
+                if args.bench_name in ['gsm8k']:
+                    acc = 1 if is_correct(output,question["reference"][j]) else 0
+                    accs.append(acc)
 
                 turns.append(output)
                 idxs.append(int(idx))
@@ -210,7 +333,7 @@ def get_model_answers(
                     "content": output
                 })
             # torch.cuda.empty_cache()
-            choices.append({"index": i, "turns": turns, "idxs": idxs, "new_tokens": new_tokens, "wall_time": wall_time})
+            choices.append({"index": i, "turns": turns, "idxs": idxs, "new_tokens": new_tokens, "wall_time": wall_time, "ppl": ppls, "acc": accs})
 
         # Dump answers
         os.makedirs(os.path.dirname(answer_file), exist_ok=True)
@@ -329,6 +452,67 @@ if __name__ == "__main__":
         "--use_eagle3",
         action="store_true"
     )
+    
+    parser.add_argument(
+        "--question_nums",
+        type=int,
+        default=20,
+        help="The number questions",
+    )
+
+    ## For quantization
+    parser.add_argument('--mode', default='base', type=str,
+                    help='quantizer mode')
+    parser.add_argument('--wbit', '-wb', default='8', type=int, 
+                        help='weight bit width')
+    parser.add_argument('--abit', '-ab', default='8', type=int, 
+                        help='activation bit width')
+    parser.add_argument('--wbit_low', '-wbl', default='4', type=int, 
+                        help='weight bit width')
+    parser.add_argument('--abit_low', '-abl', default='4', type=int, 
+                        help='activation bit width')
+    parser.add_argument('--percentile', '-pct', default='100', type=int, 
+                        help='percent')
+    parser.add_argument('--sigma', '-s', default='0', type=float, 
+                        help='Init activation range with Batchnorm Sigma')
+    parser.add_argument('--disable_quant', default=False, action='store_true', 
+                        help='disable quant')
+    parser.add_argument('--disable_input_quantization', default=False, action='store_true', 
+                        help='quant_input')
+    parser.add_argument('--search', default=False, action='store_true', 
+                        help='search alpha')
+    parser.add_argument('--w_up', '-wu', default='150', type=int, 
+                        help='weight search upper bound')
+    parser.add_argument('--a_up', '-au', default='150', type=int, 
+                        help='activation search upper bound')
+    parser.add_argument('--w_low', '-wl', default='75', type=int, 
+                        help='weight search lower bound')
+    parser.add_argument('--a_low', '-al', default='75', type=int, 
+                        help='activation search lower bound')
+    parser.add_argument('--layer_8bit_n', '-n8', default='0', type=int, 
+                        help='number of 8-bit layers')
+    parser.add_argument('--layer_8bit_l', '-l8', default=None, type=str, 
+                        help='list of 8-bit layers')
+    parser.add_argument(
+        "--quantize_batch_size",
+        type=int,
+        default=64,
+        help="Batch size (per device) for quantization.",
+    )
+    parser.add_argument(
+        "--no_outlier",
+        action="store_true"
+    )
+
+    # parser.add_argument(
+    #     "--mode",type=str,default="ant-int",
+    # )
+    # parser.add_argument("--wbit",type=int,default=8)
+    # parser.add_argument("--abit",type=int,default=8)
+    # parser.add_argument("--wbit_low",type=int,default=8)
+    # parser.add_argument("--abit_low",type=int,default=8)
+    
+
 
     args = parser.parse_args()
 
@@ -345,7 +529,7 @@ if __name__ == "__main__":
     if args.answer_file:
         answer_file = args.answer_file
     else:
-        answer_file = f"{args.bench_name}/{args.model_id}.jsonl"
+        answer_file = f"{args.bench_name}/antquant{args.wbit}{args.abit}{args.wbit_low}{args.abit_low}-{args.model_id}.jsonl"
 
     print(f"Output to {answer_file}")
 

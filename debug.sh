@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=0 python -m eagle.evaluation.gen_ea_answer_llama3chat_quant --ea-model-path /home/chenruiyang/Code/LLM/HFD/EAGLE3-LLaMA3.1-Instruct-8B --base-model-path /home/chenruiyang/Code/LLM/HFD/Llama-3.1-8B-Instruct --use_eagle3

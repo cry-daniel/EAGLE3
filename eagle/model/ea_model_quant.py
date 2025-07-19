@@ -20,6 +20,7 @@ from .cnets_quant import Model
 from .cnets1 import Model as Model1
 from .configs import EConfig
 
+from .antquant import quantize_model, quantize_model_low, set_quantizer, set_quantizer_low, enable_quantization
 
 class EaModel(nn.Module):
 
@@ -94,6 +95,7 @@ class EaModel(nn.Module):
             depth=7,
             top_k=10,
             threshold=1.0,
+            quantparams=None,
             **kwargs,
     ):
         # assert Type=="LLaMA" or "Mixtral"
@@ -111,6 +113,14 @@ class EaModel(nn.Module):
             base_model = KVMixtralForCausalLM.from_pretrained(
                 base_model_path, **kwargs
             )
+            
+        print("BaseModel Quantization Enabling")
+        # print(base_model.dtype)
+        # base_model = base_model.float()
+        set_quantizer(quantparams)
+        base_model  = quantize_model(base_model)
+        enable_quantization(base_model)
+        # base_model = base_model.half()
 
         configpath = os.path.join(ea_model_path, "config.json")
         if not os.path.exists(configpath):
@@ -238,7 +248,7 @@ class EaModel(nn.Module):
         input_len = input_ids.shape[1]
         reset_tree_mode(self)
         # prefill
-        draft_tokens, retrieve_indices, tree_mask, tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
+        draft_tokens, retrieve_indices, tree_mask, tree_position_ids, logits, hidden_state, sample_token, tree_branch_sum = initialize_tree_w_quant(
             input_ids, self, past_key_values, logits_processor
         )
         new_token = 0
@@ -248,6 +258,9 @@ class EaModel(nn.Module):
             self.base_model.model.tree_mask = tree_mask
 
             draft_tokens = draft_tokens.to(input_ids.device)
+            # e.g. [ 0,  1, 10, 31, 40, 51, -1], 这些需要高精度
+            # retrieve_indices[tree_branch_sum.argmax()]
+
             # Target model forward, get logits
             logits, hidden_state_new, outputs = tree_decoding(
                 self,
@@ -265,12 +278,12 @@ class EaModel(nn.Module):
             # [  334,     1, 43680, 43680, 43680, 43680, 43680], ...]
             candidates = draft_tokens[0, retrieve_indices]
             # verification
-            best_candidate, accept_length, sample_p = evaluate_posterior(
-                logits, candidates, logits_processor
+            best_candidate, accept_length, sample_p = evaluate_posterior_w_quant(
+                logits, candidates, logits_processor, tree_branch_sum=tree_branch_sum
             )
             # print(accept_length)
             # Adjusting the input sequence, draft model forward
-            input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
+            input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token, tree_branch_sum = update_inference_inputs_w_quant(
                 input_ids,
                 candidates,
                 best_candidate,
@@ -443,6 +456,8 @@ class EaModel(nn.Module):
                 input_ids,
                 retrieve_indices,
             )
+            # Trick: 高精度单独跑一次然后覆盖低精度结果即可。
+            
             # retrieve_indices=tree_buffers["retrieve_indices"]
             # logits = logits[0, retrieve_indices]
             draft_tokens = torch.cat((draft_tokens, padding), dim=1)

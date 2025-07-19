@@ -27,7 +27,32 @@ except:
     from eagle.model.kv_cache import initialize_past_key_values
     from eagle.model.utils import *
 
+import re
+ANS_RE = re.compile(r"#### (\-?[0-9\.\,]+)")
+INVALID_ANS = "[invalid]"
 
+def extract_final_answer(text):
+    numbers = re.findall(r'\d+', text)
+    return numbers[-1] if numbers else None
+
+def extract_answer_gsm8k(completion):
+    match = ANS_RE.search(completion)
+    if match:
+        match_str = match.group(1).strip()
+        match_str = match_str.replace(",", "")
+        return match_str
+    else:
+        return INVALID_ANS
+
+
+def is_correct(model_completion, reference):
+    generated = extract_final_answer(model_completion)
+    gt_answer = extract_answer_gsm8k(reference)
+    # print('Find answer:',generated)
+    # print('target answer:',gt_answer)
+    # print('result:',generated == gt_answer)
+    assert gt_answer != INVALID_ANS
+    return generated == gt_answer
 
 def run_eval(
         base_model_path,
@@ -113,6 +138,8 @@ def get_model_answers(
         # load_in_8bit=True,
         device_map="auto",
         use_eagle3=args.use_eagle3,
+        important_metric=args.important_metric,
+        important_metric_value=args.important_metric_value,
     )
 
     tokenizer = model.get_tokenizer()
@@ -130,7 +157,7 @@ def get_model_answers(
 
     question = questions[0]
 
-    questions=questions[:5]
+    questions=questions[:args.question_nums]
     for question in tqdm(questions):
 
         choices = []
@@ -145,6 +172,7 @@ def get_model_answers(
             new_tokens = []
             wall_time = []
             ppls = []
+            accs = []
             for j in range(len(question["turns"])):
                 qs = question["turns"][j]
                 messages.append({
@@ -176,6 +204,7 @@ def get_model_answers(
                     loss = model.base_model(output_ids, labels=output_ids).loss
 
                 ppl = torch.exp(loss)
+                ppls.append(float(ppl))
 
                 output_ids = output_ids[0][len(input_ids[0]):]
                 # be consistent with the template's stop_token_ids
@@ -208,6 +237,10 @@ def get_model_answers(
                         output = output.replace(special_token, "")
                 output = output.strip()
 
+                if args.bench_name in ['gsm8k']:
+                    acc = 1 if is_correct(output,question["reference"][j]) else 0
+                    accs.append(acc)
+
                 turns.append(output)
                 idxs.append(int(idx))
                 new_tokens.append(int(new_token))
@@ -216,9 +249,8 @@ def get_model_answers(
                     "role": "assistant",
                     "content": output
                 })
-                ppls.append(float(ppl))
             # torch.cuda.empty_cache()
-            choices.append({"index": i, "turns": turns, "idxs": idxs, "new_tokens": new_tokens, "wall_time": wall_time, "ppl": ppls})
+            choices.append({"index": i, "turns": turns, "idxs": idxs, "new_tokens": new_tokens, "wall_time": wall_time, "ppl": ppls, "acc": accs})
 
         # Dump answers
         os.makedirs(os.path.dirname(answer_file), exist_ok=True)
@@ -338,6 +370,24 @@ if __name__ == "__main__":
         action="store_true"
     )
 
+    parser.add_argument(
+        "--question_nums",
+        type=int,
+        default=20,
+        help="The number questions",
+    )
+
+    parser.add_argument(
+        "--important_metric",
+        type=str,
+        default="topk",
+    )
+    
+    parser.add_argument(
+        "--important_metric_value",
+        type=float,
+        default=100.0,
+    )
     args = parser.parse_args()
 
     for k,v in vars(args).items():
@@ -353,7 +403,7 @@ if __name__ == "__main__":
     if args.answer_file:
         answer_file = args.answer_file
     else:
-        answer_file = f"{args.bench_name}_prune/{args.model_id}.jsonl"
+        answer_file = f"{args.bench_name}_prune/{args.model_id}_{args.important_metric}{args.important_metric_value}.jsonl"
 
     print(f"Output to {answer_file}")
 

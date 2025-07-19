@@ -960,7 +960,7 @@ class Model(nn.Module):
         
         global DRAFT_MODEL_ATTN_INDEX
         print('draftattn_weights',DRAFT_MODEL_ATTN_INDEX,attnoutput .shape)
-        torch.save(attnoutput ,f'/home/ruiyang.chen/Code/LLM/EAGLE3/eagle/checkattn/draft{DRAFT_MODEL_ATTN_INDEX}.pt')
+        torch.save(attnoutput ,f'/home/chenruiyang/Code/LLM/EAGLE3/eagle/checkattn/draft{DRAFT_MODEL_ATTN_INDEX}.pt')
         DRAFT_MODEL_ATTN_INDEX+=1
 
         return draft_tokens, retrieve_indices, tree_mask, tree_position_ids

@@ -42,7 +42,7 @@ except:
     from utils import prepare_logits_processor
 
 
-
+DRAFT_MODEL_ATTN_INDEX = 0
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
 def _make_causal_mask(
@@ -1005,16 +1005,24 @@ class Model(nn.Module):
 
         # print(f"debug2: {draft_hiddens.shape, draft_tokens.shape, len(past_key_values) , tree_position_ids.shape}")
 
+        # print('important:', draft_hiddens.shape,draft_tokens.shape,tree_position_ids.shape)
+
         attn_output = self(
-            hidden_states = draft_hiddens,
-            input_ids = draft_tokens, 
+            hidden_states = torch.cat([draft_hiddens,torch.zeros((1,10,4096),dtype=draft_hiddens.dtype,device=draft_hiddens.device)],dim=1),
+            input_ids =  torch.cat([draft_tokens,torch.zeros((1,10),dtype=draft_tokens.dtype,device=draft_hiddens.device)],dim=1), 
             past_key_values = self.stable_kv, 
-            position_ids = tree_position_ids, 
+            position_ids = torch.cat([tree_position_ids,torch.zeros((10),dtype=tree_position_ids.dtype,device=draft_hiddens.device)],dim=0), 
             output_attentions = True,
             output_attn_weights = True
         )
+        attn_output = attn_output[:,:,:-10,:-10]
 
         # print(f"attn_output1: {attn_output}")
+        
+        # global DRAFT_MODEL_ATTN_INDEX
+        # print('draftattn_weights',DRAFT_MODEL_ATTN_INDEX,attn_output.shape)
+        # torch.save(attn_output ,f'/home/chenruiyang/Code/LLM/EAGLE3/eagle/checkattn/draft{DRAFT_MODEL_ATTN_INDEX}.pt')
+        # DRAFT_MODEL_ATTN_INDEX+=1
 
         return draft_tokens, retrieve_indices, tree_mask, tree_position_ids, attn_output
 

@@ -700,11 +700,13 @@ class Model(nn.Module):
         last_headout = self.lm_head(self.norm(last_hidden))
 
         last_p = self.logsoftmax(last_headout)
+        # 从 lm_head 里面选 top_k 值最高的 token
         top = torch.topk(last_p, top_k, dim=-1)
         topk_index, topk_p = top.indices, top.values
         scores = topk_p[0]
         scores_list.append(scores[None])
         parents_list.append(torch.zeros(1, dtype=torch.long, device=scores.device))
+
         if self.config.vocab_size==self.config.draft_vocab_size:
             ss_token.append(topk_index)
             input_ids = topk_index
@@ -728,21 +730,25 @@ class Model(nn.Module):
             bias1 = top_k if i > 0 else 0
             bias2 = max(0, i - 1)
             bias = 1 + top_k ** 2 * bias2 + bias1
+            # e.g., tensor([31, 21, 11, 22, 41, 12, 42, 51, 71, 81], device='cuda:0') in depth = 2
             parents = (topk_cs_index + bias)
             parents_list.append(parents)
 
+            # lm_head: dim x vocabulary_size 
             last_headout = self.lm_head(self.norm(out_hidden[0]))
             last_p = self.logsoftmax(last_headout)
 
             top = torch.topk(last_p, top_k, dim=-1)
             topk_index, topk_p = top.indices, top.values
 
+            # lm_head 筛出来的 last_p 再加上原先的 score 值，注意 topk_p 都是负数，depth 越深 cu_scores 越低
             cu_scores = topk_p + scores[:, None]
 
             topk_cs = torch.topk(cu_scores.view(-1), top_k, dim=-1)
             topk_cs_index, topk_cs_p = topk_cs.indices, topk_cs.values
             scores = topk_cs_p
 
+            # // top_k 是为了找它的父节点是哪个，因为每个父节点有 top_k 个子节点
             out_ids = topk_cs_index // top_k
             input_hidden = out_hidden[:, out_ids]
 
@@ -757,28 +763,45 @@ class Model(nn.Module):
             tree_mask = torch.cat((tree_mask[:, :, out_ids], self.tree_mask_init), dim=3)
 
 
+        # scores_list 存的都是之前的 cu_scores，和 token_list 一一对应
         scores_list = torch.cat(scores_list, dim=0).view(-1)
+        # e.g. ss_token[0].shape torch.Size([1, 10]) ss_token[1].shape torch.Size([10, 10]) ss_token[2].shape torch.Size([10, 10])
         ss_token_list = torch.cat(ss_token, dim=0).view(-1)
         top_scores = torch.topk(scores_list, total_tokens, dim=-1)
         top_scores_index = top_scores.indices
+        # e.g. tensor([  0,   1,   2,   3,   4,   5,   6,   7,   8,  10,  11,  12,  20,  21,
+        #  30,  40,  41,  50,  70,  80, 110, 111, 112, 113, 114, 120, 121, 122,
+        # 123, 124, 130, 131, 140, 150, 151, 160, 170, 180, 190, 210, 211, 220,
+        # 230, 250, 260, 270, 280, 290, 300, 310, 311, 320, 330, 340, 360, 390,
+        # 410, 420, 430], device='cuda:0')
         top_scores_index = torch.sort(top_scores_index).values
 
         draft_tokens = ss_token_list[top_scores_index]
         draft_tokens = torch.cat((sample_token, draft_tokens), dim=0)
+        # Here we add draft scores to identify important path
+        # draft_scores = scores_list[top_scores_index]
+        # draft_scores = torch.cat((draft_scores[None, 0], draft_scores), dim=0)
 
+        # e.g. parents_list: [tensor([0], device='cuda:0'), tensor([ 1,  2,  3,  4,  5,  6,  7,  8,  9, 10], device='cuda:0'), tensor([31, 21, 11, 22, 41, 12, 42, 51, 71, 81], device='cuda:0')]
         draft_parents = torch.cat(parents_list, dim=0)[top_scores_index // top_k].long()
+        # mask_index 对应每一个 token 的父节点的位置
         mask_index = torch.searchsorted(top_scores_index, draft_parents - 1, right=False)
         # mask_index[(top_scores_index[mask_index]!=draft_parents - 1)]=-1
         mask_index[draft_parents == 0] = -1
         mask_index = mask_index + 1
+        # e.g. [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 3, 4, 4, 5, 7, 8, 15, 15, 15, 15, 15, 13, 13, 13, 13, 13, 10, 10, 14, 16, 16, 11, 17, 18, 19, 31, 31, 33, 34, 22, 36, 23, 26, 32, 39, 40, 40, 43, 44, 41, 47, 42, 52, 54, 50]
         mask_index_list = mask_index.tolist()
         # with Timer("mask"):
         tree_mask = torch.eye(total_tokens + 1).bool()
         tree_mask[:, 0] = True
+        # 当前的 tree_mask 等于初始化的 tree_mask 加上父节点的 tree_mask
         for i in range(total_tokens):
             tree_mask[i + 1].add_(tree_mask[mask_index_list[i]])
 
 
+        # e.g. tensor([0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3,
+        # 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4,
+        # 4, 4, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6])
         tree_position_ids = torch.sum(tree_mask, dim=1) - 1
 
         tree_mask = tree_mask.float()[None, None]
@@ -789,14 +812,18 @@ class Model(nn.Module):
         # with Timer("retrieve"):
 
         max_depth = torch.max(tree_position_ids) + 1
+        # 所有非叶节点的索引
         noleaf_index = torch.unique(mask_index).tolist()
+        # 34
         noleaf_num = len(noleaf_index) - 1
+        # 25
         leaf_num = total_tokens - noleaf_num
 
         retrieve_indices = torch.zeros(leaf_num, max_depth.item(), dtype=torch.long) - 1
         retrieve_indices = retrieve_indices.tolist()
 
         rid = 0
+        # [0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6]
         position_ids_list = tree_position_ids.tolist()
 
         for i in range(total_tokens + 1):
@@ -820,7 +847,33 @@ class Model(nn.Module):
 
             retrieve_indices = sorted(retrieve_indices, key=custom_sort)
 
+        # tensor([[ 0,  6, -1, -1, -1, -1, -1],
+        # [ 0,  9, -1, -1, -1, -1, -1],
+        # [ 0,  1, 12, -1, -1, -1, -1],
+        # [ 0,  8, 20, -1, -1, -1, -1],
+        # [ 0,  3, 15, 21, -1, -1, -1],
+        # [ 0,  3, 15, 24, -1, -1, -1],
+        # [ 0,  3, 15, 25, -1, -1, -1],
+        # [ 0,  2, 13, 27, -1, -1, -1],
+        # [ 0,  2, 13, 28, -1, -1, -1],
+        # [ 0,  2, 13, 29, -1, -1, -1],
+        # [ 0,  2, 13, 30, -1, -1, -1],
+        # [ 0,  4, 16, 35, -1, -1, -1],
+        # [ 0,  4, 17, 37, -1, -1, -1],
+        # [ 0,  5, 18, 38, -1, -1, -1],
+        # [ 0,  1, 11, 36, 45, -1, -1],
+        # [ 0,  3, 15, 23, 46, -1, -1],
+        # [ 0,  1, 10, 32, 48, -1, -1],
+        # [ 0,  7, 19, 39, 49, -1, -1],
+        # [ 0,  1, 10, 31, 40, 51, -1],
+        # [ 0,  3, 15, 22, 44, 53, -1],
+        # [ 0,  2, 13, 26, 47, 55, -1],
+        # [ 0,  2, 14, 33, 42, 56, -1],
+        # [ 0,  4, 16, 34, 43, 52, 57],
+        # [ 0,  1, 10, 31, 41, 54, 58],
+        # [ 0,  1, 10, 31, 40, 50, 59]])
         retrieve_indices = torch.tensor(retrieve_indices, dtype=torch.long)
+
         del mask_index, mask_index_list, noleaf_index, noleaf_num, leaf_num, max_depth, rid
         tree_position_ids = tree_position_ids.to(hidden_states.device)
 
