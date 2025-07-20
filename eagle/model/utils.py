@@ -301,6 +301,31 @@ def initialize_tree_w_quant(input_ids, model, past_key_values, logits_processor)
     draft_tokens, retrieve_indices,tree_mask,tree_position_ids, tree_branch_sum = model.ea_layer.topK_genrate_w_quant(hidden_states, input_ids, model.base_model.lm_head,logits_processor)
     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, orig, hidden_states, token, tree_branch_sum
 
+def initialize_tree_w_float(input_ids, model, past_key_values, logits_processor):
+    print(past_key_values)
+    outputs, orig, hidden_states = model(
+        input_ids, past_key_values=past_key_values, output_orig=True
+    )
+
+    if logits_processor is not None:
+        logits = orig[:, -1]
+        logits = logits_processor(None, logits)
+        probabilities = torch.nn.functional.softmax(logits, dim=1)
+        token = torch.multinomial(probabilities, 1)
+    else:
+        token = torch.argmax(orig[:, -1])
+        token = token[None, None]
+    input_ids = torch.cat((input_ids, token.to(input_ids.device)), dim=1)
+
+    # Clone the output hidden states
+    if model.use_eagle3:
+        ea_device = model.ea_layer.lm_head.weight.device
+        if outputs["hidden_states"][0].device != ea_device:
+            outputs["hidden_states"] = [x.to(ea_device) for x in outputs["hidden_states"]]
+        hidden_states=torch.cat(outputs["hidden_states"],dim=-1)
+    draft_tokens, retrieve_indices,tree_mask,tree_position_ids, tree_branch_sum = model.ea_layer.topK_genrate_w_quant(hidden_states, input_ids, model.base_model.lm_head,logits_processor)
+    return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, orig, hidden_states, token, tree_branch_sum
+
 def reset_tree_mode(
         model,
 ):
@@ -393,6 +418,36 @@ def tree_decoding_highprec(
         tree_candidates,
         output_orig=True,
         past_key_values=past_key_values,
+        position_ids=position_ids,
+        high_prec=True
+    )
+
+    if model.use_eagle3:
+        ea_device = model.ea_layer.lm_head.weight.device
+        if outputs["hidden_states"][0].device != ea_device:
+            outputs["hidden_states"] = [x.to(ea_device) for x in outputs["hidden_states"]]
+        hidden_state = torch.cat(outputs["hidden_states"], dim=-1)
+
+    # 将 tree_logits 按照多个完整的话展开，每句话都会选择自己的 token 对应的那些 logits
+    # logits 其实就是 lm_head 的输出
+    logits = tree_logits[0, :]
+    return logits, hidden_state, outputs
+
+def tree_decoding_lowfloat(
+        model,
+        tree_candidates,
+        past_key_values,
+        tree_position_ids,
+        input_ids
+):
+    position_ids = tree_position_ids + input_ids.shape[1]
+    if position_ids is not None and position_ids.dim() == 1:
+            position_ids = position_ids.unsqueeze(0)
+    print(tree_candidates.dtype,past_key_values.dtype,position_ids.dtype)
+    outputs, tree_logits, hidden_state = model(
+        tree_candidates.to(dtype=torch.float8_e4m3fn),
+        output_orig=True,
+        past_key_values=past_key_values.to(dtype=torch.float8_e4m3fn),
         position_ids=position_ids,
         high_prec=True
     )

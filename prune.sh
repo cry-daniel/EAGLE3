@@ -55,3 +55,7 @@ CUDA_VISIBLE_DEVICES=0 nohup python -m eagle.evaluation.gen_ea_answer_llama3chat
 CUDA_VISIBLE_DEVICES=0 nohup python -m eagle.evaluation.gen_ea_answer_llama3chat_quant --ea-model-path /home/chenruiyang/Code/LLM/HFD/EAGLE3-LLaMA3.1-Instruct-8B --base-model-path /home/chenruiyang/Code/LLM/HFD/Llama-3.1-8B-Instruct --use_eagle3 --mode ant-int --wbit 8 --abit 8 --bench-name gsm8k > rungsm8kquant88.log 2>&1 &
 
 
+
+CUDA_VISIBLE_DEVICES=0 nohup python -m eagle.evaluation.gen_ea_answer_llama3chat_multifloat --ea-model-path /home/chenruiyang/Code/LLM/HFD/EAGLE3-LLaMA3.1-Instruct-8B --base-model-path /home/chenruiyang/Code/LLM/HFD/Llama-3.1-8B-Instruct --use_eagle3 --bench-name gsm8k > runmultifloatgsm8k.log 2>&1 &
+
+
